@@ -21,6 +21,7 @@ from backend.app.library.models import DubState, Episode, Export, ExportState, S
 from backend.app.library.store import LibraryStore, _new_id
 from backend.app.services.cookie_vault import CookieVault
 from backend.app.services.job_service import JobService
+from backend.app.settings import SettingsStore, chat_agent
 from backend.app.studio.models import Platform
 from backend.app.studio.providers import SourceDiscovery, canonical_source_url, detect_platform
 
@@ -32,6 +33,7 @@ _CHANNEL_SCAN_LIMIT = 500
 _JOB_TO_DUB = {
     JobState.queued: DubState.translating,
     JobState.running: DubState.translating,
+    JobState.review: DubState.review,
     JobState.succeeded: DubState.dubbed,
     JobState.failed: DubState.failed,
     JobState.canceled: DubState.none,
@@ -276,17 +278,25 @@ class LibraryService:
             ep.dub_stage = failed.name if failed else None
             ep.dub_stage_index = len(m.stages)
             ep.dub_error = m.error or (failed.error if failed else None)
+        elif m.progress and not m.stages:
+            # A queued job prefetching its video: the download is already under way.
+            ep.dub_stage = m.progress.get("stage")
+            ep.dub_stage_index = 1
+            ep.dub_progress = m.progress
         elif not m.stages:
             ep.dub_stage = "queued"
             ep.dub_stage_index = 0
         else:
             ep.dub_stage = m.stages[-1].name
             ep.dub_stage_index = len(m.stages)
+            if m.progress and m.progress.get("stage") == str(m.stages[-1].name):
+                ep.dub_progress = m.progress
 
     def translate(self, series_id: str, episode_ids: list[str]) -> list[str]:
         """Dub each episode (one job). A FAILED job is resumed in place — the pipeline
         restarts at the broken stage and reuses the video/ASR/translation already on
-        disk (re-downloading everything on every retry wasted minutes per episode).
+        disk (re-downloading everything on every retry wasted minutes per episode),
+        with the providers set now, not the ones frozen when the job was created.
         Only a previously SUCCEEDED dub is replaced from scratch. Returns the job ids."""
         job_ids: list[str] = []
         for episode_id in episode_ids:
@@ -301,6 +311,8 @@ class LibraryService:
                     except Exception:
                         pass
                 job_id = self.jobs.create(JobInput(url=ep.source_url, series_id=series_id, source_video_id=ep.id)).job_id
+            else:
+                self.jobs.refresh_settings(job_id)
             self.jobs.start_background(job_id)
             self.store.set_episode_dub(ep.id, job_id, DubState.translating)
             job_ids.append(job_id)
@@ -507,7 +519,7 @@ class LibraryService:
             raw = complete(system, user, self._agent())
             data = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
         except Exception as exc:
-            raise LibraryError("Không tạo được gợi ý (agent CLI lỗi)") from exc
+            raise LibraryError("Không tạo được gợi ý (agent lỗi)") from exc
         tags = data.get("hashtags") or []
         return {
             "title": (data.get("title") or "").strip(),
@@ -517,17 +529,8 @@ class LibraryService:
 
     # ----- LLM-assisted naming / clustering -------------------------------
     def _agent(self) -> AgentConfig:
-        settings = self.settings
-        return AgentConfig(
-            provider=settings.agent_provider,
-            bin=settings.agent_bin,
-            home=settings.agent_home,
-            command=settings.agent_command,
-            model=settings.translate_model,
-            effort=settings.agent_effort,
-            timeout=settings.agent_timeout,
-            retries=settings.agent_retries,
-        )
+        """The agent bound to the naming task (current settings; env when never saved)."""
+        return chat_agent(SettingsStore(self.settings).load(), "naming", self.settings)
 
     def _refine_with_llm(self, groups: list[Group], videos: list) -> list[Group]:
         """Use the LLM only when the heuristic is unsure: many titles lack a "第X集"

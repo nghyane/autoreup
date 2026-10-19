@@ -22,6 +22,21 @@ class FrontendContractTest(unittest.TestCase):
         for text in forbidden:
             self.assertNotIn(text, source)
 
+    def test_settings_modal_is_organised_by_job(self):
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [ROOT / "frontend/src/Settings.tsx", *(ROOT / "frontend/src/settings").glob("*.tsx")]
+        )
+        for tab in ("Dịch thuật", "Giọng đọc", "Phụ đề & lời thoại", "Tài khoản nền tảng"):
+            self.assertIn(f'label: "{tab}"', source)
+        self.assertIn("Speech-to-Text", source)
+        self.assertIn("Nâng cao", source)
+        # no generic connection editor: no connection tab, no "Loại" picker, no raw ids on screen
+        self.assertNotIn('label: "Kết nối"', source)
+        self.assertNotIn("<span>Loại</span>", source)
+        self.assertNotIn("{conn.id}</span>", source)
+        self.assertNotIn(">ASR<", source)
+
 
 if __name__ == "__main__":
     unittest.main()

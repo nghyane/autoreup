@@ -15,9 +15,17 @@ silero-vad==6.2.1
 onnxruntime==1.27.0
 # Douyin a_bogus signature (infrastructure/douyin): gmssl provides the SM3 hash.
 gmssl==3.2.2
+# Edge read-aloud TTS engine (services/tts_engines.py), imported only when a
+# connection of type "edge" synthesizes.
+edge-tts==7.3.1  # 7.2.x gets HTTP 403 from the Edge endpoint
+# Local VieNeu-TTS engine (services/tts_engines.py, ONNX/CPU), imported only when a
+# "vieneu" connection synthesizes or is checked. Pinned: the engine wraps its artifact
+# fetch and lists its preset voices statically.
+vieneu==3.8.3
 
-# Optional: local ASR backend (Apple Silicon only). Without it the pipeline uses the
+# Optional: local ASR backends (Apple Silicon only). Without them the pipeline uses the
 # Cloudflare worker (AUTOREUP_ASR_BACKEND=worker). Install separately:
-#   pip install mlx-whisper==0.4.3
+#   pip install "mlx-qwen3-asr[aligner]==0.4.4"   # backend=qwen (preferred by auto)
+#   pip install mlx-whisper==0.4.3                # backend=local
 #
 # Optional: font for the burned subtitle (default ships in backend/app/assets/fonts).

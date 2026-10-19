@@ -1,5 +1,7 @@
 import type {
+  AppSettings,
   ChannelGroup,
+  ConnectionProbe,
   Episode,
   Export,
   GlossaryEntry,
@@ -11,6 +13,7 @@ import type {
   SeriesSource,
   SourceVideo,
   SubtitleCue,
+  TtsVoice,
 } from "./types";
 
 async function ok(response: Response, message: string) {
@@ -81,6 +84,63 @@ export async function saveCookies(platform: string, cookies: string): Promise<vo
     }),
     "Không lưu được cookie",
   );
+}
+
+export async function loadAppSettings(): Promise<AppSettings> {
+  const response = await ok(await fetch("/api/v1/settings"), "Không tải được cài đặt");
+  return (await response.json()) as AppSettings;
+}
+
+export async function saveAppSettings(settings: AppSettings): Promise<AppSettings> {
+  const response = await fetch("/api/v1/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    const detail = payload?.detail;
+    throw new Error(typeof detail === "string" ? detail : detail ? JSON.stringify(detail) : "Không lưu được cài đặt");
+  }
+  return (await response.json()) as AppSettings;
+}
+
+export async function testConnection(id: string): Promise<ConnectionProbe> {
+  const response = await ok(
+    await fetch(`/api/v1/settings/connections/${encodeURIComponent(id)}/test`, { method: "POST" }),
+    "Không kiểm tra được kết nối",
+  );
+  return (await response.json()) as ConnectionProbe;
+}
+
+export async function listConnectionModels(id: string): Promise<string[]> {
+  const response = await fetch(`/api/v1/settings/connections/${encodeURIComponent(id)}/models`);
+  if (!response.ok) return [];
+  return ((await response.json()) as { models: string[] }).models;
+}
+
+export async function listTtsVoices(connection: string, type = ""): Promise<TtsVoice[]> {
+  const query = new URLSearchParams({ connection, ...(type ? { type } : {}) });
+  const response = await ok(
+    await fetch(`/api/v1/settings/tts/voices?${query}`),
+    "Không tải được danh sách giọng",
+  );
+  return ((await response.json()) as { voices: TtsVoice[] }).voices;
+}
+
+/** Synthesize a short sample with the (saved) connection and the draft voice/model;
+ *  a keyless `type` (edge, vieneu) needs no saved connection. */
+export async function previewTts(body: { connection: string; voice: string; model: string; type?: string }): Promise<Blob> {
+  const response = await fetch("/api/v1/settings/tts/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(typeof payload?.detail === "string" ? payload.detail : "Không nghe thử được giọng");
+  }
+  return response.blob();
 }
 
 export async function discoverVideos(url: string): Promise<SourceVideo[]> {
@@ -240,6 +300,8 @@ export type CoverRegion = {
   mode: string;
   strength: number;
   label: string;
+  /** mode "image": the library file name (fetchOverlayImages) */
+  image?: string;
 };
 
 export type OverlayConfig = {
@@ -247,7 +309,58 @@ export type OverlayConfig = {
   caption_y: number | null;
   caption_scale: number;
   cover: CoverRegion[];
+  /** caption font file (one of fetchFonts); "" = the app default */
+  font?: string;
+  /** video bitrate for the render ("2500k", "4M"); "" = the app setting */
+  bitrate?: string;
+  /** original audio under the dub (0-1); null = the app setting (frame.bed_volume) */
+  bed_volume?: number | null;
+  /** the dub itself (0-1) */
+  voice_volume?: number;
+  /** original audio where nobody speaks (0-1); null = the app setting (frame.gap_volume) */
+  gap_volume?: number | null;
 };
+
+export type BitratePreset = { value: string; label: string; hint: string; vmaf: number };
+
+export type OverlayEncode = {
+  source_codec: string;
+  source_bitrate: number;
+  /** the app's default render bitrate (one of presets, normally) */
+  default: string;
+  audio_bitrate: number;
+  presets: BitratePreset[];
+};
+
+export type FontInfo = { path: string; name: string; source: "app" | "user" | "system" };
+
+export async function fetchFonts(): Promise<{ default: string; fonts: FontInfo[] }> {
+  const response = await ok(await fetch("/api/v1/settings/fonts"), "Không tải được danh sách font");
+  return (await response.json()) as { default: string; fonts: FontInfo[] };
+}
+
+export type OverlayImage = { name: string; width: number; height: number };
+
+/** The user's images (logo, watermark…) to stamp on renders; files live under ``base``. */
+export async function fetchOverlayImages(): Promise<{ base: string; images: OverlayImage[] }> {
+  const response = await ok(await fetch("/api/v1/settings/images"), "Không tải được thư viện ảnh");
+  return (await response.json()) as { base: string; images: OverlayImage[] };
+}
+
+export async function uploadOverlayImage(file: File): Promise<OverlayImage> {
+  const body = new FormData();
+  body.append("file", file);
+  const response = await fetch("/api/v1/settings/images", { method: "POST", body });
+  if (!response.ok) {
+    const detail = await response.json().then((data: { detail?: unknown }) => data.detail, () => null);
+    throw new Error(typeof detail === "string" ? detail : "Không tải ảnh lên được");
+  }
+  return (await response.json()) as OverlayImage;
+}
+
+export function fontFileUrl(path: string): string {
+  return `/api/v1/settings/fonts/file?path=${encodeURIComponent(path)}`;
+}
 
 export type OverlayFrame = {
   out: { width: number; height: number };
@@ -256,6 +369,11 @@ export type OverlayFrame = {
   pad: { x: number; y: number };
   font_size?: number;
   duration: number;
+  encode?: OverlayEncode;
+  /** the app's default level for the original audio under the dub */
+  bed_volume?: number;
+  /** the app's default level for the original audio where nobody speaks */
+  gap_volume?: number;
 };
 
 export type OverlayState = OverlayConfig & { frame?: OverlayFrame };

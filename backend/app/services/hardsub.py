@@ -42,7 +42,10 @@ class HardsubConfig:
     band_pad: int = 26        # extra px around the detected band so the original sub's outline is fully covered
     blur: int = 20            # boxblur radius (ffmpeg caps at 23); applied twice for strong coverage
     darken: float = 0.12
-    bed_volume: float = 0.55
+    bed_volume: float = 0.18
+    voice_volume: float = 1.0
+    gap_volume: float = 0.0  # original audio where nobody speaks; <= bed_volume = no boost
+    images_dir: str = ""  # the user's image library (services.overlay_images) for "image" regions
     duck: bool = True
     carve_db: float = -3.0
     # Encoder + canonical geometry (filled from Settings). See preferred_video_codec_args:
@@ -157,17 +160,55 @@ def overlay_geometry(src_width: int, src_height: int, band: tuple[int, int, int,
     return OverlayGeometry(out_width, out_height, round(scale, 6), pad_x, pad_y, caption_cy)
 
 
-def render_caption_png(text: str, path: Path, width: int, height: int, baseline_y: int, font, config: HardsubConfig) -> None:
-    """One full-frame transparent PNG with the caption on its fixed baseline."""
+def render_caption_png(text: str, path: Path, width: int, height: int, baseline_y: int, font, config: HardsubConfig, base=None) -> None:
+    """One full-frame transparent PNG with the caption on its fixed baseline, drawn over
+    ``base`` (the stamp layer) when given."""
     from PIL import Image, ImageDraw
 
-    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    img = base.copy() if base is not None else Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.text((width // 2, baseline_y), text, font=font, anchor="ms",
               fill=(255, 255, 255, 255),
               stroke_width=max(2, round(config.font_size * 0.05)),
               stroke_fill=(0, 0, 0, 255))
     img.save(path)
+
+
+def _stamp_layer(config: HardsubConfig, width: int, height: int):
+    """The user's images (overlay regions with mode "image") on one transparent
+    full-frame RGBA layer — each fitted inside its box (aspect kept, centred) at the
+    region's opacity — or None when there are none.
+
+    The layer rides on the caption overlay, so the images sit above the covers (one can
+    hide the original channel logo) and below the Vietnamese caption, with no extra
+    ffmpeg input."""
+    overlay = getattr(config, "overlay", None)
+    regions = [region.normalized() for region in (overlay.cover if overlay is not None else []) if region.mode == "image"]
+    if not regions:
+        return None
+    from PIL import Image
+
+    from backend.app.services.overlay_images import resolve_image
+
+    layer = None
+    for region in regions:
+        path = resolve_image(config.images_dir, region.image)
+        if path is None:
+            continue  # gone from the library: render without it rather than fail
+        box_x, box_y = round(region.x * width), round(region.y * height)
+        box_w, box_h = max(1, round(region.w * width)), max(1, round(region.h * height))
+        with Image.open(path) as source:
+            image = source.convert("RGBA")
+        scale = min(box_w / image.width, box_h / image.height)
+        image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.LANCZOS)
+        if region.strength < 1.0:
+            image.putalpha(image.getchannel("A").point(lambda alpha: round(alpha * region.strength)))
+        if layer is None:
+            layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        x = min(box_x + (box_w - image.width) // 2, width - image.width)
+        y = min(box_y + (box_h - image.height) // 2, height - image.height)
+        layer.alpha_composite(image, (max(0, x), max(0, y)))
+    return layer
 
 
 def render_overlay_frame(video: Path, output: Path, t: float, config: HardsubConfig, caption: str = "") -> None:
@@ -197,13 +238,14 @@ def render_overlay_frame(video: Path, output: Path, t: float, config: HardsubCon
     graph = f"[0:v]{','.join(filters)}[scaled];" + cover.replace("[0:v]", "[scaled]")
 
     inputs = ["-ss", f"{max(0.0, t):.3f}", "-i", str(video)]
-    if caption.strip():
+    stamp = _stamp_layer(config, geometry.out_width, geometry.out_height)
+    if caption.strip() or stamp is not None:
         with tempfile.TemporaryDirectory() as tmp:
             font = ImageFont.truetype(config.font_path, config.font_size)
             ascent, descent = font.getmetrics()
             png = Path(tmp) / "caption.png"
             render_caption_png(caption, png, geometry.out_width, geometry.out_height,
-                               caption_cy + (ascent - descent) // 2, font, config)
+                               caption_cy + (ascent - descent) // 2, font, config, base=stamp)
             graph += "[cov][1:v]overlay=0:0[vo]"
             run_command([
                 "ffmpeg", "-y", "-v", "error", *inputs, "-i", str(png),
@@ -223,8 +265,10 @@ def _build_overlay_video(cues: list[dict], sub_dir: Path, width: int, height: in
 
     sub_dir.mkdir(parents=True, exist_ok=True)
     font = ImageFont.truetype(config.font_path, config.font_size)
+    # the user's images stay on screen the whole video: under every caption and in the gaps
+    stamp = _stamp_layer(config, width, height)
     blank = sub_dir / "blank.png"
-    Image.new("RGBA", (width, height), (0, 0, 0, 0)).save(blank)
+    (stamp if stamp is not None else Image.new("RGBA", (width, height), (0, 0, 0, 0))).save(blank)
 
     # Anchor every caption to a FIXED baseline from the font's own metrics — NOT each
     # line's bounding box. The bbox height varies with the glyphs present (a comma/period
@@ -235,7 +279,7 @@ def _build_overlay_video(cues: list[dict], sub_dir: Path, width: int, height: in
     baseline_y = caption_cy + (ascent - descent) // 2  # center the fixed line-box on the band
 
     def render(text: str, path: Path) -> None:
-        render_caption_png(text, path, width, height, baseline_y, font, config)
+        render_caption_png(text, path, width, height, baseline_y, font, config, base=stamp)
 
     ordered = sorted([c for c in cues if (c.get("text") or "").strip()], key=lambda c: float(c["start"]))
     entries: list[tuple[Path, float]] = []
@@ -261,7 +305,7 @@ def _build_overlay_video(cues: list[dict], sub_dir: Path, width: int, height: in
 
     run_command([
         "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(concat),
-        "-vsync", "vfr", "-c:v", "qtrle", "-pix_fmt", "argb", str(output),
+        "-fps_mode", "vfr", "-c:v", "qtrle", "-pix_fmt", "argb", str(output),
     ])
 
 
@@ -277,6 +321,8 @@ def _cover_regions(band, config: HardsubConfig, out_width: int, out_height: int,
     if overlay is not None:
         regions = []
         for region in overlay.cover:
+            if region.mode == "image":
+                continue  # stamped on the caption layer (_stamp_layer), not a cover
             x = int(region.x * out_width)
             y = int(region.y * out_height)
             w = max(2, int(region.w * out_width)) - (int(region.w * out_width) % 2)
@@ -293,6 +339,14 @@ def _cover_regions(band, config: HardsubConfig, out_width: int, out_height: int,
     return []
 
 
+def _blur_radii(blur: int, w: int, h: int) -> tuple[int, int]:
+    """boxblur radii that fit the cropped box: ffmpeg wants radius < side/2 on every
+    plane, yuv420p chroma is half size, and an odd crop snaps down to even — an 80px
+    band caps luma at 39 and chroma at 19 (h//4 = 20 crashed the whole render)."""
+    half = min(w, h) // 2
+    return max(0, min(blur, half - 1)), max(0, min(blur, (half - 1) // 2))
+
+
 def _build_cover_chain(regions: list[tuple[int, int, int, int, str, float]], config: HardsubConfig) -> str:
     """ffmpeg chain: apply every cover region to the incoming frame in turn."""
     if not regions:
@@ -304,11 +358,7 @@ def _build_cover_chain(regions: list[tuple[int, int, int, int, str, float]], con
             box = f"drawbox=x={x}:y={y}:w={w}:h={h}:color=black@1.0:t=fill"
             parts.append(f"[v{index}]{box}[{label}]")
             continue
-        blur_src = max(1, round(config.blur * max(0.2, strength)))
-        # yuv420p planes: luma allows ~h/2, chroma (half-res) ~h/4. Clamp to both so a
-        # short band can never crash the filter graph (74px band -> chroma cap 18).
-        luma_r = max(1, min(blur_src, h // 2))
-        chroma_r = max(1, min(blur_src, h // 4))
+        luma_r, chroma_r = _blur_radii(max(1, round(config.blur * max(0.2, strength))), w, h)
         if mode == "darken":
             box = f"boxblur={luma_r}:2:{chroma_r}:2,boxblur={luma_r}:2:{chroma_r}:2,eq=brightness=-{min(1.0, config.darken * strength):.2f}"
         else:
@@ -375,10 +425,21 @@ def build_hardsub(video: Path, cues: list[dict], voice_track: Path | None, outpu
     ) if part] or ["null"]
     video_graph = f"[0:v]{','.join(picture_filters)}[scaled];" + cover.replace("[0:v]", "[scaled]") + f"[cov][1:v]overlay=0:0[vo]"
 
+    gap_boost = None
     if has_voice:
-        from backend.app.services.audio import dub_mix_filter
+        from backend.app.services.audio import dub_mix_filter, render_gap_gain
 
-        audio_graph = ";" + dub_mix_filter("[0:a:0]", "[2:a:0]", "[aout]", config.bed_volume, duck=config.duck, carve_db=config.carve_db)
+        bed_gain = None
+        if config.gap_volume > config.bed_volume:
+            gain_path = work_dir / "bed_gain.wav"
+            gap_boost = render_gap_gain(video, Path(voice_track), gain_path, config.bed_volume, config.gap_volume)
+            if gap_boost:
+                inputs += ["-i", str(gain_path)]
+                bed_gain = "[3:a:0]"
+        audio_graph = ";" + dub_mix_filter(
+            "[0:a:0]", "[2:a:0]", "[aout]", config.bed_volume, duck=config.duck, carve_db=config.carve_db,
+            voice_volume=config.voice_volume, bed_gain=bed_gain,
+        )
         amap = ["-map", "[aout]"]
     else:
         audio_graph = ""
@@ -393,4 +454,4 @@ def build_hardsub(video: Path, cues: list[dict], voice_track: Path | None, outpu
         "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
         str(output),
     ])
-    return {"covered": band is not None, "band": band, "caption_cy": caption_cy, "cues": len(cues)}
+    return {"covered": band is not None, "band": band, "caption_cy": caption_cy, "cues": len(cues), "gap_boost": gap_boost}

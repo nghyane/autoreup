@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     data_dir_name: str = "data"
     frontend_dir_name: str = "frontend"
     # Agent runtime — headless CLI agents (no LLM API keys).
-    agent_provider: str = "agy"  # agy | command
+    agent_provider: str = "agy"  # agy | claude | codex | command
     agent_bin: str = "agy"
     agent_home: str | None = None  # HOME override for the child process (account isolation)
     # provider=command: template with {prompt}, e.g. "acpx claude exec --format quiet {prompt}"
@@ -39,10 +39,11 @@ class Settings(BaseSettings):
     asr_gap_min_seconds: float = 5.0
     asr_gap_speech_floor: float = 0.10
     asr_ocr_subs: bool = True  # OCR burned-in subtitles as the primary transcript source
-    # auto = mlx-whisper on this machine when installed, else the Cloudflare worker.
-    # (The worker's free tier has a daily neuron cap: measured 4006 "used up your daily
-    # free allocation", which failed every ASR job until the quota reset.)
-    asr_backend: str = "auto"  # auto | local | worker
+    # auto = Qwen3-ASR (mlx-qwen3-asr) on this machine when installed, else mlx-whisper,
+    # else the Cloudflare worker. (The worker's free tier has a daily neuron cap: measured
+    # 4006 "used up your daily free allocation", which failed every ASR job until the
+    # quota reset.)
+    asr_backend: str = "auto"  # auto | qwen | local | worker
     cookies_file: str | None = None
     browser_path: str | None = None  # Chrome/Edge binary for the headless Douyin extractor
     node_bin: str = "node"
@@ -106,7 +107,8 @@ class Settings(BaseSettings):
     # source of the raspy "rè" artifact (ffmpeg here has no rubberband for a clean shift),
     # so keep it OFF (1.0). The presence EQ in VOICE_MASTER_CHAIN already adds brightness.
     tts_pitch_shift: float = 1.0
-    dub_bed_volume: float = 0.55  # bed stays loud; the sidechain ducks it under the dub
+    dub_bed_volume: float = 0.18  # quiet bed under the dub; the sidechain ducks it further while the voice speaks
+    dub_gap_volume: float = 0.7  # original audio where nobody speaks (source VAD + dub); <= bed = off
     dub_duck: bool = True
     dub_carve_db: float = -3.0  # original audio kept as a quiet bed under the VI voice (was 0.38)
     # Hardsub: cover the original burned-in subtitle (OCR/cv2-detected band) + burn VI
@@ -120,7 +122,9 @@ class Settings(BaseSettings):
     # the box. Falls back to libx264 off-macOS or when videotoolbox isn't in the ffmpeg
     # build. Hardsub already emits canonical 1080p/30fps so exports just stream-copy.
     video_hw_encode: bool = True
-    video_bitrate: str = "8M"   # target for hardware encode (no CRF on videotoolbox)
+    # Default render quality (see ffmpeg_encode.BITRATE_PRESETS, VMAF-measured): 2.5M
+    # is "like the source" for 1080p30; the editor can pick another tier per episode.
+    video_bitrate: str = "2500k"
     # Light CAS sharpening on the picture during hardsub: Douyin serves ~1Mbps for
     # 1080p (measured: best gear 981kbps), visibly soft. 0 disables.
     video_sharpen: float = 0.35

@@ -62,7 +62,7 @@ class ProductionPipelineTest(unittest.TestCase):
 
             from backend.app.agents.workspace import WorkspaceRun
 
-            def fake_run(workspace, prompt, config, *, timeout=None, resume=False):
+            def fake_run(workspace, prompt, config, *, timeout=None, resume=False, cancel=None):
                 # the real agent writes artifacts; the stub does the same
                 ws = Path(workspace)
                 (ws / "out").mkdir(parents=True, exist_ok=True)
@@ -305,3 +305,15 @@ class DownloadCacheTest(unittest.TestCase):
             self.assertTrue(ctx.artifacts["video"].exists())
             self.assertEqual(ctx.artifacts["video"].read_bytes(), cached.read_bytes())
             # and the cache was seeded on a fresh download in the normal path
+
+    def test_asr_worker_url_only_required_for_the_worker_backend(self):
+        from backend.app.pipeline import production as prod
+
+        self.assertTrue(prod._asr_uses_worker("worker"))
+        self.assertFalse(prod._asr_uses_worker("local"))
+        self.assertFalse(prod._asr_uses_worker("qwen"))
+        # auto runs locally when mlx-qwen3-asr or mlx-whisper is importable, else the worker
+        with patch.object(prod.importlib.util, "find_spec", return_value=object()):
+            self.assertFalse(prod._asr_uses_worker("auto"))
+        with patch.object(prod.importlib.util, "find_spec", return_value=None):
+            self.assertTrue(prod._asr_uses_worker("auto"))

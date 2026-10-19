@@ -2,8 +2,8 @@
 
 > Studio local: **video Trung/Nhật → video Việt hoá** — phụ đề 1 dòng + **voice-over tiếng Việt**,
 > cùng một nguồn `master_vi`, đóng gói hardsub (che phụ đề gốc + burn sub Việt + mix bed gốc).
-> Không gọi API LLM: mọi bước chữ nghĩa chạy qua **agent CLI headless** (Antigravity `agy` bằng
-> subscription OAuth, hoặc CLI bất kỳ qua template).
+> Mặc định không cần API key: mọi bước chữ nghĩa chạy qua **agent CLI headless** (Antigravity `agy`, Claude Code
+> `claude` hay Codex `codex` bằng gói đăng ký đã đăng nhập, hoặc CLI bất kỳ qua template) — hoặc chọn kết nối LLM API (OpenAI-compatible, Gemini) trong Cài đặt.
 
 ```
 download → asr → glossary → translate → qa → voiceover → package
@@ -13,7 +13,7 @@ download → asr → glossary → translate → qa → voiceover → package
 
 | Lớp | Việc | Ghi chú |
 |---|---|---|
-| L1 Rail | OCR phụ đề burn-in (macOS Vision) **trước**, ASR chỉ phiên âm phần speech mà caption không phủ | cost model đo được: `none`/`glue`/`full` |
+| L1 Rail | OCR phụ đề burn-in (macOS Vision, hoặc LLM đọc ảnh) **trước**, ASR chỉ phiên âm phần speech mà caption không phủ | cost model đo được: `none`/`glue`/`full` |
 | L2 Unit | gộp caption thành câu/cụm nghĩa (60/90 ký tự) | đơn vị *định thời*, không phải đơn vị lấy context |
 | L3 Dịch | **1 workspace agent run**: `SKILL.md` + `input/` → agent đọc toàn transcript, ghi `out/draft.tsv`, tự soát nghĩa → `out/final.tsv`; pipeline đọc file + **gate code** từng dòng đổi | không nhét ngân sách độ dài vào prompt |
 | L4 Đo | TTS 1 clip/unit → thời lượng THẬT | cache theo text |
@@ -28,14 +28,15 @@ Chi tiết kiến trúc/quyết định: **[`docs/SPEC.md`](docs/SPEC.md)** (sou
 
 - **macOS** (bắt buộc cho OCR Vision + tuỳ chọn ASR local MLX; phần còn lại chạy được ở nơi khác)
 - Python **3.13**, `ffmpeg`, Node **≥ 22** (tool Douyin CDP + build frontend)
-- Một **agent CLI headless** đã đăng nhập (`agy`) — hoặc bất kỳ CLI nào qua `AUTOREUP_AGENT_COMMAND`
+- Một **agent CLI headless** đã đăng nhập (`agy`, `claude` hoặc `codex`) — hoặc bất kỳ CLI nào qua `AUTOREUP_AGENT_COMMAND`
 
 ## Cài đặt nhanh
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-pip install mlx-whisper              # ASR local (Apple Silicon) — bỏ qua nếu dùng worker
+pip install "mlx-qwen3-asr[aligner]==0.4.4"  # ASR local Qwen3-ASR (Apple Silicon) — khuyến nghị
+pip install mlx-whisper              # ASR local Whisper (tuỳ chọn) — bỏ qua cả hai nếu dùng worker
 pip install -r requirements-dev.txt  # pytest
 
 cd frontend && npm install && npm run build && cd ..
@@ -45,14 +46,16 @@ uvicorn backend.app.main:app --port 8000
 
 Mở `http://127.0.0.1:8000`. UI dev: `cd frontend && npm run dev`.
 
-## ASR: hai backend
+## ASR: ba backend
 
 | Backend | Khi nào | Đo được |
 |---|---|---|
-| **local** (mlx-whisper, cùng model large-v3-turbo) | mặc định khi đã cài mlx-whisper | **11.1× realtime** trên M4 |
+| **qwen** (mlx-qwen3-asr: Qwen3-ASR-1.7B 8-bit + ForcedAligner, timestamp từng chữ) | mặc định khi đã cài mlx-qwen3-asr | ~15× realtime trên M4; tập phim 15 phút: lỗi chữ 0.075 vs 0.177 (Whisper), ảo giác nhạc 11 vs 51, lỗ hổng lời 0 vs 5 |
+| **local** (mlx-whisper, cùng model large-v3-turbo) | khi chỉ cài mlx-whisper | ~23× realtime trên M4 |
 | **worker** (Cloudflare Workers AI) | máy không phải Apple Silicon | ~4.2× realtime, có quota neuron/ngày |
 
-`AUTOREUP_ASR_BACKEND=auto|local|worker`. Worker template ở [`worker-ai/`](worker-ai/) (wrangler + Workers AI binding).
+`AUTOREUP_ASR_BACKEND=auto|qwen|local|worker` (`auto` = cái đầu tiên đã cài theo thứ tự qwen → local → worker).
+Lần chạy đầu của `qwen` tải ~3.7 GB model (ASR 8-bit + aligner) từ Hugging Face. Gap-fill (nghe lại khoảng trống) vẫn chỉ chạy qua worker. Worker template ở [`worker-ai/`](worker-ai/) (wrangler + Workers AI binding).
 
 ## Chỉnh overlay ngay trong UI
 
@@ -66,13 +69,17 @@ Toạ độ lưu dạng phân số (0..1) nên không phụ thuộc độ phân 
 
 ## Cấu hình
 
-Toàn bộ qua env `AUTOREUP_*` (xem [`.env.example`](.env.example) và `docs/SPEC.md` §12).
-Cookie provider nhập từ UI, lưu ở `.autoreup-private/cookies/` — không bao giờ được serve ra ngoài.
+Env `AUTOREUP_*` (xem [`.env.example`](.env.example) và `docs/SPEC.md` §12) là cấu hình khởi đầu.
+**⚙ Cài đặt** trong UI: tab *Kết nối* (agent CLI, LLM API OpenAI-compatible/Gemini, CapCut, máy chủ TTS, Edge, OpenAI-compatible/Gemini/ElevenLabs TTS…), *Tác vụ* (kết nối + model riêng cho
+dịch / thuật ngữ / chuẩn hoá / sửa độ dài / đặt tên, OCR), *Giọng đọc & ASR* (chọn engine/giọng/model, nút *Nghe thử*; Edge TTS cần `edge-tts` trong `requirements.txt`; **VieNeu (máy này)** chạy VieNeu-TTS v3 Turbo ngay trên máy (ONNX/CPU, ~1.2 GB RAM, WAV 48 kHz, 25 giọng Việt), lần đầu tải model ~1.2 GB vào cache HuggingFace rồi hardlink sang `data/models/vieneu/`). Khi đã lưu, `.autoreup-private/settings.json`
+đè env (chưa lưu lần nào → chạy y hệt env); job mới dùng ngay, job đang có giữ cấu hình lúc tạo.
+Cookie provider nhập từ UI, lưu ở `.autoreup-private/cookies/`; secret (API key, mật khẩu) chỉ ở `settings.json`
+(chmod 600) — không bao giờ được serve hay trả về qua API.
 
 ## Tests
 
 ```bash
-. .venv/bin/activate && python -m pytest tests/ -q    # 112 tests
+. .venv/bin/activate && python -m pytest tests/ -q
 ```
 
 ## Cấu trúc

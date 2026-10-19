@@ -171,8 +171,10 @@ class SourceDiscovery:
 
     def _bilibili_view(self, bvid: str) -> dict:
         """Bilibili's public view API — carries full metadata AND the ``ugc_season``
-        collection (合集) the video belongs to, when it belongs to one."""
-        api_url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+        collection (合集) the video belongs to, when it belongs to one.
+        Uses the ``wbi/`` route: the legacy ``/x/web-interface/view`` is risk-controlled
+        (HTTP 412) for non-browser clients, while ``wbi/view`` answers unsigned."""
+        api_url = f"https://api.bilibili.com/x/web-interface/wbi/view?bvid={bvid}"
         req = Request(api_url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"})
         with urlopen(req, timeout=20) as response:
             payload = json.loads(response.read().decode())

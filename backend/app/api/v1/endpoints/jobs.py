@@ -71,7 +71,7 @@ async def job_events(job_id: str) -> StreamingResponse:
             if payload != last_payload:
                 yield f"data: {payload}\n\n"
                 last_payload = payload
-            if manifest.state in {JobState.succeeded, JobState.failed, JobState.canceled}:
+            if manifest.state in {JobState.succeeded, JobState.failed, JobState.canceled, JobState.review}:
                 return
             await asyncio.sleep(1)
 
@@ -109,6 +109,7 @@ class CoverRegionIn(BaseModel):
     mode: str = "blur"
     strength: float = Field(default=1.0, gt=0.0, le=1.0)
     label: str = ""
+    image: str = ""
 
 
 class OverlayIn(BaseModel):
@@ -116,6 +117,11 @@ class OverlayIn(BaseModel):
     caption_y: float | None = None
     caption_scale: float = 1.0
     cover: list[CoverRegionIn] = Field(default_factory=list)
+    font: str = ""
+    bitrate: str = ""
+    bed_volume: float | None = Field(default=None, ge=0.0, le=1.0)
+    voice_volume: float = Field(default=1.0, ge=0.0, le=1.0)
+    gap_volume: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 def _overlay_context(job_id: str):
@@ -163,6 +169,26 @@ def _frame_info(video: Path) -> dict:
         "pad": {"x": geometry.pad_x, "y": geometry.pad_y},
         "font_size": config.font_size,
         "duration": duration,
+        "encode": _encode_info(video),
+        "bed_volume": get_job_service().settings.dub_bed_volume,
+        "gap_volume": get_job_service().settings.dub_gap_volume,
+    }
+
+
+def _encode_info(video: Path) -> dict:
+    """The render quality tiers (measured, see BITRATE_PRESETS) and the source's own
+    codec/rate, so the editor can label each choice with the file size it produces."""
+    from backend.app.api.deps import get_job_service
+    from backend.app.infrastructure.ffmpeg_encode import BITRATE_PRESETS, probe_video
+
+    settings = get_job_service().settings
+    probe = probe_video(video) or {}
+    return {
+        "source_codec": probe.get("codec", ""),
+        "source_bitrate": probe.get("bit_rate", 0),
+        "default": settings.video_bitrate,
+        "audio_bitrate": 192_000,
+        "presets": list(BITRATE_PRESETS),
     }
 
 
@@ -209,13 +235,11 @@ def overlay_frame(job_id: str, payload: OverlayIn, t: float = 1.0, text: str = "
 
 @router.post("/{job_id}/repack", response_model=JobResponse)
 def repack_job(job_id: str) -> JobResponse:
-    """Re-run the pipeline from the package stage (picks up the saved overlay)."""
+    """Approve the render and run the package stage (picks up the saved overlay)."""
     service = get_job_service()
     try:
-        manifest = service.get(job_id)
+        return JobResponse(job=service.approve_render(job_id))
     except JobNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Job not found") from exc
-    if manifest.state == JobState.running:
-        raise HTTPException(status_code=409, detail="Job đang chạy.")
-    service.start_background(job_id)
-    return JobResponse(job=service.get(job_id))
+    except JobBusyError as exc:
+        raise HTTPException(status_code=409, detail="Job đang chạy.") from exc

@@ -19,14 +19,27 @@ Pipeline (measured ~4s for a 106s episode, 24.5x realtime, no re-encode):
 
 from __future__ import annotations
 
+import json
 import subprocess
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .models import AsrSegment
 from .text import clean
 
+if TYPE_CHECKING:
+    import numpy as np
+
+    from backend.app.agents import AgentConfig
+
 Band = tuple[int, int, int, int]  # (band_y, band_h, width, height) — see hardsub.detect_sub_band
+# One gray crop of the (padded) subtitle band per stable caption run in, one text per
+# crop out ("" = no caption read). The seam between change detection and the reader.
+Recognizer = Callable[[list["np.ndarray"]], list[str]]
+_OCR_BATCH = 200  # crops per recognizer call (a multiple of llm_recognizer's batch of 20)
 
 
 @dataclass(slots=True)
@@ -58,22 +71,135 @@ def ocr_coverage(segments: list[AsrSegment], duration: float) -> float:
     return sum(seg.duration for seg in segments) / duration
 
 
-def extract_ocr_segments(video: Path, band: Band, config: OcrExtractConfig | None = None) -> list[AsrSegment] | None:
-    """OCR the burned-in subtitle track into an ASR-shaped rail.
-
-    Returns ``None`` (never an exception) when OCR can't run at all — Vision
-    unavailable, or the ffmpeg decode failed — so the caller falls back to Whisper.
-    Returns ``[]`` when OCR ran cleanly but found no captions (a same-condition signal
-    as ``None`` for the caller's coverage check, kept distinct for logging clarity)."""
+def vision_recognizer(config: OcrExtractConfig | None = None) -> Recognizer | None:
+    """macOS Vision reader, or ``None`` when ocrmac is unavailable."""
     try:
         from ocrmac import ocrmac
     except Exception:
         return None
     import cv2
-    import numpy as np
     from PIL import Image
 
     config = config or OcrExtractConfig()
+
+    def recognize(crops: list["np.ndarray"]) -> list[str]:
+        texts: list[str] = []
+        for crop in crops:
+            pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB))
+            try:
+                result = ocrmac.OCR(pil, recognition_level="accurate",
+                                    language_preference=["zh-Hans", "en-US"]).recognize()
+            except Exception:
+                texts.append("")
+                continue
+            # Vision returns one box PER LINE, so a wrapped two-line caption is two
+            # candidates here — keep every box that passes the filters (not just the
+            # widest) or the second line silently vanished from the transcript. Vision's
+            # bbox is bottom-left origin (larger y = higher on screen), so sort descending
+            # to read top line first.
+            candidates: list[tuple[float, str]] = []
+            for candidate_text, conf, (bx, by, bw, _bh) in result or []:
+                cx = bx + bw / 2
+                if conf >= config.min_conf and config.cx_lo < cx < config.cx_hi and bw > config.min_width_frac:
+                    candidates.append((by, candidate_text.strip()))
+            candidates.sort(key=lambda c: -c[0])
+            texts.append("".join(part for _, part in candidates if part))
+        return texts
+
+    return recognize
+
+
+OCR_LLM_SYSTEM = (
+    "You are an OCR engine for the burned-in subtitles of Chinese short dramas. "
+    "Each image is a horizontal strip cut from the bottom of one video frame. "
+    "For every image, transcribe the subtitle caption exactly as written (keep the "
+    "original Chinese characters and punctuation; do not translate, correct or explain). "
+    "A caption wrapped over two lines is one caption: join the lines top to bottom with "
+    "no separator. Ignore watermarks, logos, usernames and UI text at the edges. "
+    "If an image has no caption, use an empty string. "
+    'Reply with ONLY a JSON object mapping each image number to its text, e.g. {"1": "…", "2": ""}.'
+)
+
+
+def _parse_indexed_texts(reply: str, count: int) -> list[str]:
+    """``{"1": text, …}`` (fenced or with chatter around it) -> one text per image.
+
+    Out-of-range, non-numeric or non-string entries are ignored; a missing index reads
+    as "" (that caption is dropped and the ASR gap-fill covers its speech)."""
+    from backend.app.agents import AgentError
+
+    # The first decodable object wins: tolerates code fences and chatter on either
+    # side, including chatter that itself contains braces.
+    decoder = json.JSONDecoder()
+    data = None
+    start = reply.find("{")
+    while start != -1 and not isinstance(data, dict):
+        try:
+            data, _end = decoder.raw_decode(reply, start)
+        except ValueError:
+            data = None
+        start = reply.find("{", start + 1)
+    if not isinstance(data, dict):
+        raise AgentError(f"ocr llm: phản hồi không phải JSON object: {reply[:120]!r}")
+    texts = [""] * count
+    for key, value in data.items():
+        try:
+            index = int(str(key).strip())
+        except ValueError:
+            continue
+        if 1 <= index <= count and isinstance(value, str):
+            texts[index - 1] = value.strip()
+    return texts
+
+
+def llm_recognizer(agent: "AgentConfig", batch_size: int = 20) -> Recognizer:
+    """Reader backed by a vision-capable LLM API: ``batch_size`` PNG crops per request,
+    each with the agent runtime's retry/backoff.
+
+    A request that still fails raises ``AgentError`` — the caller treats OCR as unavailable and
+    the Whisper rail stands alone, same as a missing Vision."""
+    import cv2
+
+    from backend.app.agents import AgentError, complete
+
+    def recognize(crops: list["np.ndarray"]) -> list[str]:
+        texts: list[str] = []
+        for offset in range(0, len(crops), batch_size):
+            batch = crops[offset:offset + batch_size]
+            images: list[bytes] = []
+            for crop in batch:
+                ok, encoded = cv2.imencode(".png", crop)
+                if not ok:
+                    raise AgentError("ocr llm: không mã hoá được ảnh PNG")
+                images.append(encoded.tobytes())
+            user = f"{len(batch)} images, numbered 1 to {len(batch)} in the order given."
+            texts += _parse_indexed_texts(complete(OCR_LLM_SYSTEM, user, agent, images=images), len(batch))
+        return texts
+
+    return recognize
+
+
+def extract_ocr_segments(
+    video: Path,
+    band: Band,
+    config: OcrExtractConfig | None = None,
+    recognizer: Recognizer | None = None,
+) -> list[AsrSegment] | None:
+    """OCR the burned-in subtitle track into an ASR-shaped rail.
+
+    ``recognizer`` reads the caption crops (default: macOS Vision). Returns ``None``
+    when OCR can't run at all — no recognizer (Vision unavailable), or the ffmpeg
+    decode failed — so the caller falls back to Whisper; a recognizer's own error
+    (e.g. an LLM API failure) propagates for the caller to log, with the same fallback.
+    Returns ``[]`` when OCR ran cleanly but found no captions (a same-condition signal
+    as ``None`` for the caller's coverage check, kept distinct for logging clarity)."""
+    config = config or OcrExtractConfig()
+    recognizer = recognizer or vision_recognizer(config)
+    if recognizer is None:
+        return None
+    import cv2
+    import numpy as np
+
     band_y, band_h, width, height = band
     if band_h <= 0 or width <= 0:
         return None
@@ -86,75 +212,100 @@ def extract_ocr_segments(video: Path, band: Band, config: OcrExtractConfig | Non
     crop_h = crop_y1 - crop_y0
     band_top = band_y - crop_y0
 
-    proc = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(video),
-         "-vf", f"crop={width}:{crop_h}:0:{crop_y0},fps={config.fps},format=gray",
-         "-f", "rawvideo", "-"],
-        capture_output=True,
-    )
-    if proc.returncode != 0 or not proc.stdout:
-        return None
-    frame_bytes = width * crop_h
-    n = len(proc.stdout) // frame_bytes
-    if n < 2:
-        return None
-    frames = np.frombuffer(proc.stdout[: n * frame_bytes], dtype=np.uint8).reshape(n, crop_h, width)
-    band_frames = frames[:, band_top:band_top + band_h, :]
-
-    # --- change detection on a text-mask column profile (not raw pixels) ---
+    # Convert to gray BEFORE cropping: on a 4:2:0 source ffmpeg silently rounds an odd
+    # crop height down to even (measured: 175 -> 174 rows), so every frame read here
+    # would be one row short, the index drifts 1/crop_h behind the video and the
+    # captions land seconds early (19.5s at minute 57 of a 2.6h episode).
+    #
+    # Frames are streamed one at a time and dropped once seen: the whole band of a long
+    # video does not fit in memory (1920x200 gray at 4 fps is ~43 GB for a 7.7h video,
+    # and holding it all once took the backend to 145 GB and got it killed).
     x0, x1 = int(width * 0.18), int(width * 0.82)
+    empty_floor = config.empty_frac * band_h * (x1 - x0)
+    frame_bytes = width * crop_h
 
-    def mask_col(frame: "np.ndarray") -> tuple["np.ndarray", int]:
+    def mask_col(frame: "np.ndarray") -> tuple["np.ndarray", bool]:
+        """Normalized text-mask column profile (not raw pixels) and whether the band is empty."""
         bright = (frame >= 195).astype(np.uint8)
         dark = cv2.dilate((frame <= 85).astype(np.uint8), np.ones((5, 5), np.uint8))
         text = (bright & dark)[:, x0:x1]
-        return text.sum(axis=0).astype(np.float32), int(text.sum())
+        col = text.sum(axis=0).astype(np.float32)
+        norm = np.linalg.norm(col)
+        return (col / norm if norm > 0 else col), float(text.sum()) < empty_floor
 
-    cols = np.empty((n, x1 - x0), dtype=np.float32)
-    totals = np.empty(n, dtype=np.float32)
-    for i, frame in enumerate(band_frames):
-        cols[i], totals[i] = mask_col(frame)
+    # A run of frames with the same caption ends where the profile changes; its middle
+    # frame is the one OCR'd. The middle only moves forward as the run grows, so only
+    # the frames from the current middle on are kept. Crops are OCR'd in batches as they
+    # come, so a long video's thousands of cues are never all held at once either.
+    cue_runs: list[tuple[int, int]] = []
+    crops: list["np.ndarray"] = []
+    texts: list[str] = []
+    run: deque[tuple[int, "np.ndarray"]] = deque()
+    cursor = run_empty = n = 0
+    prev_col = prev_empty = None
 
-    def normalize(vec: "np.ndarray") -> "np.ndarray":
-        norm = np.linalg.norm(vec)
-        return vec / norm if norm > 0 else vec
+    def recognize_crops() -> None:
+        batch = crops.copy()  # the recognizer may keep the list it was handed
+        crops.clear()
+        read = recognizer(batch)
+        if len(read) != len(batch):  # a short reply must not shift captions in time
+            raise ValueError(f"ocr-subs: recognizer returned {len(read)} texts for {len(batch)} crops")
+        texts.extend(read)
 
-    normalized = np.array([normalize(c) for c in cols])
-    diff = 1 - np.sum(normalized[1:] * normalized[:-1], axis=1)
-    empty = totals < (config.empty_frac * band_h * (x1 - x0))
-    changed = (diff > config.diff_threshold) | (empty[1:] != empty[:-1])
+    def close_run(end: int) -> None:
+        if run_empty <= 0.5 * (end - cursor):
+            cue_runs.append((cursor, end))
+            crops.append(run[0][1])
+            if len(crops) >= _OCR_BATCH:
+                recognize_crops()
 
-    runs: list[tuple[int, int]] = []
-    cursor = 0
-    for i, is_change in enumerate(changed):
-        if is_change:
-            runs.append((cursor, i + 1))
-            cursor = i + 1
-    runs.append((cursor, n))
-    cue_runs = [r for r in runs if empty[r[0]:r[1]].mean() <= 0.5]
-
-    # --- OCR one representative frame per stable run ---
-    segments: list[AsrSegment] = []
-    for start_i, end_i in cue_runs:
-        mid = frames[(start_i + end_i) // 2]
-        pil = Image.fromarray(cv2.cvtColor(mid, cv2.COLOR_GRAY2RGB))
+    partial = False
+    with subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-i", str(video),
+         "-vf", f"format=gray,crop={width}:{crop_h}:0:{crop_y0},fps={config.fps}",
+         "-f", "rawvideo", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    ) as proc:
         try:
-            result = ocrmac.OCR(pil, recognition_level="accurate",
-                                language_preference=["zh-Hans", "en-US"]).recognize()
-        except Exception:
-            continue
-        # Vision returns one box PER LINE, so a wrapped two-line caption is two
-        # candidates here — keep every box that passes the filters (not just the
-        # widest) or the second line silently vanished from the transcript. Vision's
-        # bbox is bottom-left origin (larger y = higher on screen), so sort descending
-        # to read top line first.
-        candidates: list[tuple[float, str]] = []
-        for candidate_text, conf, (bx, by, bw, _bh) in result or []:
-            cx = bx + bw / 2
-            if conf >= config.min_conf and config.cx_lo < cx < config.cx_hi and bw > config.min_width_frac:
-                candidates.append((by, candidate_text.strip()))
-        candidates.sort(key=lambda c: -c[0])
-        text = clean("".join(part for _, part in candidates if part))
+            while chunk := proc.stdout.read(frame_bytes):
+                if len(chunk) < frame_bytes:
+                    partial = True
+                    break
+                frame = np.frombuffer(chunk, dtype=np.uint8).reshape(crop_h, width)
+                col, is_empty = mask_col(frame[band_top:band_top + band_h])
+                if prev_col is not None and (
+                    1 - float(np.sum(col * prev_col)) > config.diff_threshold or is_empty != prev_empty
+                ):
+                    close_run(n)
+                    cursor, run_empty = n, 0
+                    run.clear()
+                run.append((n, frame))
+                run_empty += is_empty
+                n += 1
+                while run[0][0] < (cursor + n) // 2:
+                    run.popleft()
+                prev_col, prev_empty = col, is_empty
+        except BaseException:
+            proc.kill()  # don't leave ffmpeg blocked on a full pipe
+            raise
+    if proc.returncode != 0:
+        return None
+    if partial:
+        # Frames of another size than asked for: slicing them would shift every
+        # caption in time, so refuse and let the caller fall back to ASR.
+        raise RuntimeError(
+            f"ocr-subs: ffmpeg returned a trailing partial frame, not a multiple of the "
+            f"{width}x{crop_h} frame — caption timing would drift"
+        )
+    if n < 2:
+        return None
+    close_run(n)
+
+    if crops:
+        recognize_crops()
+    segments: list[AsrSegment] = []
+    for (start_i, end_i), raw in zip(cue_runs, texts, strict=True):
+        text = clean(raw)
         if text:
             segments.append(AsrSegment(
                 id=len(segments) + 1,

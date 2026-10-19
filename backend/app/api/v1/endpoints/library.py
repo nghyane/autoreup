@@ -26,6 +26,8 @@ router = APIRouter()
 # (Douyin checks Referer). We proxy them — restricted to known image hosts so this
 # can't be turned into an open SSRF relay.
 _THUMB_HOSTS = ("douyinpic.com", "pstatp.com", "bytecdn.com", "byteimg.com", "douyincdn.com", "hdslb.com", "bilivideo.com")
+# Bilibili's CDN hotlink-guards too, and answers 403 to a douyin.com Referer.
+_BILIBILI_THUMB_HOSTS = ("hdslb.com", "bilivideo.com")
 
 
 @router.get("/thumb")
@@ -33,9 +35,11 @@ def proxy_thumbnail(url: str) -> Response:
     host = urlparse(url).netloc.lower()
     if not any(host.endswith(h) or host == h for h in _THUMB_HOSTS):
         raise HTTPException(status_code=400, detail="Host ảnh không được phép")
+    is_bilibili = any(host.endswith(h) for h in _BILIBILI_THUMB_HOSTS)
+    referer = "https://www.bilibili.com/" if is_bilibili else "https://www.douyin.com/"
     try:
         resp = httpx.get(url, timeout=10, follow_redirects=True,
-                         headers={"Referer": "https://www.douyin.com/", "User-Agent": "Mozilla/5.0"})
+                         headers={"Referer": referer, "User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
     except Exception as exc:
         raise HTTPException(status_code=404, detail="Không tải được ảnh") from exc

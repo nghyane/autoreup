@@ -37,12 +37,11 @@ def package_outputs(video: Path, subtitle_json: Path, subtitle_srt: Path, packag
     if shutil.which("ffmpeg") and voice_track and voice_track.exists():
         from backend.app.services.hardsub import build_hardsub
 
-        try:
-            summary = build_hardsub(video, cues, voice_track, hardsub_path, packages_dir / f"{stem}.hswork", hardsub_config)
-            logs.append(f"hardsub: {summary}")
-            artifacts.append(_artifact(ArtifactKind.hardsub_mp4, hardsub_path, root_data_dir))
-        except Exception as exc:  # don't fail the whole job on a render hiccup
-            logs.append(f"hardsub failed: {exc}")
+        # A failed render fails the stage: the episode must not read "dubbed" with no
+        # video. Every earlier stage is kept, so a retry only re-runs this render.
+        summary = build_hardsub(video, cues, voice_track, hardsub_path, packages_dir / f"{stem}.hswork", hardsub_config)
+        logs.append(f"hardsub: {summary}")
+        artifacts.append(_artifact(ArtifactKind.hardsub_mp4, hardsub_path, root_data_dir))
     elif shutil.which("ffmpeg"):
         run_command([
             "ffmpeg", "-y", "-v", "error", "-i", str(video), "-i", str(subtitle_srt),

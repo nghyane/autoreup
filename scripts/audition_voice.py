@@ -23,6 +23,7 @@ from backend.app.core.config import Settings  # noqa: E402
 from backend.app.pipeline.production import _build_capcut_client  # noqa: E402
 from backend.app.services.audio import master_voice  # noqa: E402
 from backend.app.services.tts import clean_tts_text  # noqa: E402
+from backend.app.settings import SettingsStore, tts_binding  # noqa: E402
 
 SAMPLE = (
     "Lão thần có nằm mơ cũng không ngờ, để trốn lệnh triệu hồi sang dị giới, "
@@ -58,7 +59,11 @@ def fetch_catalog(settings: Settings, client) -> list[dict]:
 
 def main() -> None:
     settings = Settings()
-    client = _build_capcut_client(settings)
+    app = SettingsStore(settings).load()
+    task, conn = tts_binding(app)
+    if conn is None or conn.type != "capcut":
+        raise SystemExit("TTS connection is not CapCut (Cài đặt → Giọng đọc & ASR)")
+    client = _build_capcut_client(settings, conn, task.voice)
     if client is None:
         raise SystemExit("no CapCut client (session/login failed)")
     OUT.mkdir(parents=True, exist_ok=True)

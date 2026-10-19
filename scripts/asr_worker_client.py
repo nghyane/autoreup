@@ -1,11 +1,16 @@
-"""ASR client for the pipeline: one CLI, two backends.
+"""ASR client for the pipeline: one CLI, three backends.
 
+``qwen``   — Qwen3-ASR-1.7B + Qwen3-ForcedAligner on Apple Silicon (mlx-qwen3-asr).
+             Measured against Whisper turbo on real jobs: 2.4x fewer character errors
+             on a drama episode (0.073 vs 0.177 vs the on-screen captions), 51 -> 9
+             music hallucinations, no missed-speech holes (Whisper: 5, 11.6s) — at
+             ~15x realtime on M4 (Whisper turbo: ~23x).
 ``local``  — mlx-whisper on Apple Silicon (same large-v3-turbo weights as the worker,
-             no network, no quota; the local-first default).
+             no network, no quota).
 ``worker`` — the Cloudflare Workers AI whisper endpoint (portable, but the free tier
              has a daily neuron allocation: measured 4006 "used up your daily free
              allocation of 10,000 neurons", which failed every ASR job that day).
-``auto``   — local when mlx-whisper is importable, worker otherwise.
+``auto``   — qwen, else local, else worker: the first one installed.
 """
 
 import argparse
@@ -93,6 +98,56 @@ def transcribe_local(video_path: str, language: str, model: str) -> list[dict]:
         {"start": float(seg["start"]), "end": float(seg["end"]), "text": str(seg.get("text") or "")}
         for seg in result.get("segments", [])
     ]
+
+
+# 8-bit Qwen3-ASR-1.7B: on a 15-min drama slice the same error rate and rail stats as
+# the fp16 "Qwen/Qwen3-ASR-1.7B" (6 cues differ, punctuation/one name), 60s vs 93s.
+QWEN_DEFAULT_REPO = "moona3k/mlx-qwen3-asr-1.7b-8bit"
+
+
+def qwen_repo(model: str) -> str:
+    """The pipeline's model setting holds a Whisper slug by default; only an explicit
+    Qwen3-ASR repo (or local path naming one) overrides the default checkpoint."""
+    return model if "qwen" in model.lower() else QWEN_DEFAULT_REPO
+
+
+def phrases_from_qwen(words: list[dict], chunks: list[dict], language: str, text: str, max_chars: int) -> list[dict]:
+    """Aligner words (one per CJK character) -> timed phrases of at most ``max_chars``.
+
+    Grouping on the words keeps every cue's start/end on a real aligned character,
+    instead of letting ``normalize_cues`` split a long phrase proportionally. A chunk
+    the aligner returned nothing for (a language it doesn't cover) still yields its
+    text, spanning the chunk — the VAD pass tightens it later — so no speech is lost.
+    """
+    from mlx_qwen3_asr.writers import group_subtitle_segments
+
+    # display width: a CJK character counts 2, so max_chars characters = 2*max_chars
+    phrases = group_subtitle_segments(words, language=language, text=text, max_chars=2 * max_chars)
+    for chunk in chunks:
+        start, end = float(chunk["start"]), float(chunk["end"])
+        if str(chunk.get("text") or "").strip() and not any(start <= w["start"] < end for w in words):
+            phrases.append({"start": start, "end": end, "text": str(chunk["text"]).strip()})
+    return sorted(phrases, key=lambda seg: (seg["start"], seg["end"]))
+
+
+def transcribe_qwen(video_path: str, language: str, model: str, max_chars: int) -> list[dict]:
+    """Whole-file Qwen3-ASR with forced-aligned timestamps (the library chunks at pauses)."""
+    from mlx_qwen3_asr import transcribe
+
+    def on_progress(event: dict) -> None:
+        # same "ASR <done>/<total>" line as the worker path: the pipeline parses it
+        if event.get("event") == "chunk_completed":
+            print(f"ASR {event['chunk_index']}/{event['total_chunks']}", flush=True)
+
+    result = transcribe(
+        video_path,
+        model=qwen_repo(model),
+        language=None if language in ("", "auto") else language,
+        return_timestamps=True,
+        return_chunks=True,
+        on_progress=on_progress,
+    )
+    return phrases_from_qwen(result.segments or [], result.chunks or [], result.language, result.text, max_chars)
 
 
 def srt_time(second: float) -> str:
@@ -260,13 +315,15 @@ def pick_backend(requested: str) -> str:
         return requested
     import importlib.util
 
+    if importlib.util.find_spec("mlx_qwen3_asr"):
+        return "qwen"
     return "local" if importlib.util.find_spec("mlx_whisper") else "worker"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("video")
-    parser.add_argument("--backend", choices=("auto", "local", "worker"), default="auto")
+    parser.add_argument("--backend", choices=("auto", "qwen", "local", "worker"), default="auto")
     parser.add_argument("--worker-url", default="")
     parser.add_argument("--output", default=None)
     parser.add_argument("--language", default="zh")
@@ -284,7 +341,10 @@ def main() -> None:
     output = Path(args.output) if args.output else Path("data/subtitles") / f"{Path(args.video).stem}.asr.zh.srt"
 
     backend = pick_backend(args.backend)
-    if backend == "local":
+    if backend == "qwen":
+        print(f"ASR backend: qwen ({qwen_repo(args.model)})")
+        all_segments = transcribe_qwen(args.video, args.language, args.model, args.max_chars)
+    elif backend == "local":
         print(f"ASR backend: local ({local_repo(args.model)})")
         all_segments = transcribe_local(args.video, args.language, args.model)
     else:

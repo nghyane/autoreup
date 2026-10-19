@@ -18,6 +18,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from backend.app.services.audio import align_audio, assemble_track, master_voice, probe_duration, require_ffmpeg, speed_clip, trim_silence
 from backend.app.services.tts import (
@@ -25,10 +26,20 @@ from backend.app.services.tts import (
     TtsBlock,
     clean_tts_text,
     raw_audio_path,
+    to_provider_scale,
 )
 from .models import SpeechRow
 from .text import strip_explicit_turn_markers
 from .timeline import RowPlan, TimelineConfig, plan_rows, summarize
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from backend.app.services.capcut_tts import CapCutTtsClient
+    from backend.app.services.tts_engines import TtsEngine
+
+
+_SYNTH_CHUNK = 64  # clips per engine call before they are written to the cache
 
 
 @dataclass(slots=True)
@@ -107,77 +118,97 @@ def _blocks_from_rows(rows: list[SpeechRow], text_mode: str) -> tuple[list[TtsBl
     return blocks, usable
 
 
+def _legacy_engine(config: RenderConfig, synth_client) -> "TtsEngine":
+    """Engine for callers that still pass a CapCut client (or nothing → the HTTP server)."""
+    from backend.app.services.tts_engines import CapCutEngine, HttpEngine
+
+    if synth_client is not None:
+        return CapCutEngine(
+            synth_client,
+            config.speaker,
+            batch_size=config.batch_size,
+            concurrency=config.batch_concurrency,
+            rate=config.synth_rate,
+            volume=to_provider_scale(config.volume),
+            cache_id=config.provider_url,
+        )
+    provider = HttpTtsProvider(
+        config.provider_url,
+        speaker=config.speaker,
+        speed=config.speed,
+        pitch=config.pitch,
+        volume=config.volume,
+        timeout=config.timeout,
+        attempts=config.attempts,
+    )
+    return HttpEngine(provider, cache_id=config.provider_url, workers=config.workers)
+
+
 def render(
     speech_rows: list[SpeechRow],
     config: RenderConfig,
     work_dir: Path,
     cache_dir: Path,
     synth_client: "CapCutTtsClient | None" = None,
+    engine: "TtsEngine | None" = None,
+    on_synth: "Callable[[int, int], None] | None" = None,
 ) -> RenderResult:
     """Synthesize every row and place it at its caption; report measured timings.
 
-    Does NOT assemble the final track (the fit loop re-measures first); call
-    :func:`assemble_voice` once timings converge.
+    Every synth goes through ``engine`` (its ``cache_id`` keys the raw-clip cache); a
+    legacy ``synth_client`` becomes a CapCut engine. Does NOT assemble the final track
+    (the fit loop re-measures first); call :func:`assemble_voice` once timings converge.
+    ``on_synth(done, total)`` follows the clips synthesized in this call (cache misses).
     """
     require_ffmpeg()
     blocks, usable = _blocks_from_rows(speech_rows, config.text_mode)
     if not blocks:
         return RenderResult(voice_track=None, summary={"blocks": 0, "rows": 0})
 
-    provider = None
-    if synth_client is None:
-        provider = HttpTtsProvider(
-            config.provider_url,
-            speaker=config.speaker,
-            speed=config.speed,
-            pitch=config.pitch,
-            volume=config.volume,
-            timeout=config.timeout,
-            attempts=config.attempts,
-        )
+    if engine is None:
+        engine = _legacy_engine(config, synth_client)
     cache_dir = Path(cache_dir)
     work_dir = Path(work_dir)
 
     def raw_path_for(block: TtsBlock) -> Path:
         return raw_audio_path(
-            cache_dir, config.provider_url, config.speaker, block,
+            cache_dir, engine.cache_id, engine.voice, block,
             speed=config.synth_rate, pitch=config.pitch, volume=config.volume, text_mode=config.text_mode,
         )
 
-    if synth_client is not None:
-        from backend.app.services.capcut_tts import synthesize_many
-        from backend.app.services.tts import to_provider_scale
+    def store_raw(raw_path: Path, audio: bytes) -> None:
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = raw_path.with_name(f"{raw_path.stem}.{os.getpid()}-{threading.get_ident()}.build{raw_path.suffix}")
+        tmp.write_bytes(audio)
+        trim_silence(tmp)
+        speed_clip(tmp, config.synth_rate)
+        tmp.replace(raw_path)
 
-        todo = [(raw_path_for(b), b) for b in blocks]
-        todo = [(rp, b) for rp, b in todo if not (rp.exists() and rp.stat().st_size > 1024)]
-        if todo:
-            audios = synthesize_many(
-                synth_client,
-                [b.text for _, b in todo],
-                batch_size=config.batch_size,
-                concurrency=config.batch_concurrency,
-                rate=config.synth_rate,
-                volume=to_provider_scale(config.volume),
-            )
-            for (rp, _block), audio in zip(todo, audios):
-                rp.parent.mkdir(parents=True, exist_ok=True)
-                tmp = rp.with_name(f"{rp.stem}.{os.getpid()}-{threading.get_ident()}.build{rp.suffix}")
-                tmp.write_bytes(audio)
-                trim_silence(tmp)
-                speed_clip(tmp, config.synth_rate)
-                tmp.replace(rp)
+    # 0) synthesize only the clips not cached yet, in chunks so a late failure keeps
+    # everything already paid for
+    todo = [(raw_path_for(b), b) for b in blocks]
+    todo = [(rp, b) for rp, b in todo if not (rp.exists() and rp.stat().st_size > 1024)]
+    for start in range(0, len(todo), _SYNTH_CHUNK):
+        chunk = todo[start : start + _SYNTH_CHUNK]
+        try:
+            audios = engine.synthesize_batch([b.text for _, b in chunk])
+        except RuntimeError as exc:
+            # keep the clips that did synthesize (TtsEngineError.partial), then fail loudly
+            done = [(rp, audio) for (rp, _b), audio in zip(chunk, getattr(exc, "partial", None) or []) if audio]
+            with ThreadPoolExecutor(max_workers=max(1, config.workers)) as pool:
+                list(pool.map(lambda item: store_raw(*item), done))
+            raise
+        if len(audios) != len(chunk):
+            raise RuntimeError(f"TTS engine returned {len(audios)} clips for {len(chunk)} texts")
+        with ThreadPoolExecutor(max_workers=max(1, config.workers)) as pool:
+            list(pool.map(store_raw, [rp for rp, _ in chunk], audios))
+        if on_synth is not None:
+            on_synth(start + len(chunk), len(todo))
 
     def ensure_raw(block: TtsBlock) -> Path:
         raw_path = raw_path_for(block)
-        raw_path.parent.mkdir(parents=True, exist_ok=True)
         if not (raw_path.exists() and raw_path.stat().st_size > 1024):
-            if provider is None:
-                raise RuntimeError(f"native synth produced no audio for block {block.block_id}")
-            tmp = raw_path.with_name(f"{raw_path.stem}.{os.getpid()}-{threading.get_ident()}.build{raw_path.suffix}")
-            tmp.write_bytes(provider.synthesize(block.text))
-            trim_silence(tmp)
-            speed_clip(tmp, config.synth_rate)
-            tmp.replace(raw_path)
+            raise RuntimeError(f"TTS produced no audio for block {block.block_id}")
         return raw_path
 
     # 1) raw synth (parallel) and raw durations

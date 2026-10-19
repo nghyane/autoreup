@@ -1,12 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as api from "./api";
-import type { Episode, Export } from "./types";
+import type { AppSettings, Episode, Export } from "./types";
 
 /** Query keys + data hooks — the single source of server state. Components read these
  *  instead of fetching/polling by hand; mutations invalidate the right keys so the UI
  *  stays consistent without manual reloads. */
 export const keys = {
   providers: ["providers"] as const,
+  appSettings: ["app-settings"] as const,
+  models: (connection: string) => ["app-settings", "models", connection] as const,
+  voices: (connection: string, type = "") => ["app-settings", "voices", connection, type] as const,
   seriesList: (q: string) => ["series", { q }] as const,
   series: (id: string) => ["series", id] as const,
   episodes: (id: string) => ["series", id, "episodes"] as const,
@@ -15,6 +18,14 @@ export const keys = {
 
 // ----- queries --------------------------------------------------------------
 export const useProviders = () => useQuery({ queryKey: keys.providers, queryFn: api.loadProviders });
+
+export const useAppSettings = () => useQuery({ queryKey: keys.appSettings, queryFn: api.loadAppSettings });
+
+export const useConnectionModels = (connection: string) =>
+  useQuery({ queryKey: keys.models(connection), queryFn: () => api.listConnectionModels(connection), enabled: !!connection });
+
+export const useTtsVoices = (connection: string, type = "") =>
+  useQuery({ queryKey: keys.voices(connection, type), queryFn: () => api.listTtsVoices(connection, type), enabled: !!connection, retry: false });
 
 export const useSeriesList = (q: string) =>
   useQuery({ queryKey: keys.seriesList(q), queryFn: () => api.listSeries(q) });
@@ -43,7 +54,7 @@ export const useExports = (id: string) =>
 
 // ----- mutations ------------------------------------------------------------
 /** Invalidate everything under a series (detail counts + episodes + exports). */
-function useSeriesInvalidator() {
+export function useSeriesInvalidator() {
   const qc = useQueryClient();
   return (seriesId?: string) => {
     qc.invalidateQueries({ queryKey: ["series"] });
@@ -138,5 +149,18 @@ export function useSaveCookies() {
   return useMutation({
     mutationFn: ({ platform, cookies }: { platform: string; cookies: string }) => api.saveCookies(platform, cookies),
     onSuccess: () => qc.invalidateQueries({ queryKey: keys.providers }),
+  });
+}
+
+export function useSaveAppSettings() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (settings: AppSettings) => api.saveAppSettings(settings),
+    onSuccess: (saved) => {
+      qc.setQueryData(keys.appSettings, saved);
+      // a saved key/address changes what a service lists
+      qc.invalidateQueries({ queryKey: [...keys.appSettings, "models"] });
+      qc.invalidateQueries({ queryKey: [...keys.appSettings, "voices"] });
+    },
   });
 }

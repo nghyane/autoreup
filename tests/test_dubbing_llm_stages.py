@@ -45,7 +45,7 @@ def _workspace_writer(texts, *, record=None, omit=()):
     """Fake agent run: writes out/draft.tsv + out/final.tsv, records the calls."""
     from backend.app.agents.workspace import WorkspaceRun
 
-    def fake(workspace, prompt, config, *, timeout=None, resume=False):
+    def fake(workspace, prompt, config, *, timeout=None, resume=False, cancel=None):
         ws = Path(workspace)
         (ws / "out").mkdir(parents=True, exist_ok=True)
         body = "\n".join(f"{i}\t{t}" for i, t in texts.items() if i not in omit)
@@ -81,7 +81,7 @@ def test_workspace_translate_gates_unsafe_edits(monkeypatch, tmp_path):
     segments, anchors = _rail_and_units()
     from backend.app.agents.workspace import WorkspaceRun
 
-    def fake(workspace, prompt, config, *, timeout=None, resume=False):
+    def fake(workspace, prompt, config, *, timeout=None, resume=False, cancel=None):
         ws = Path(workspace)
         (ws / "out").mkdir(parents=True, exist_ok=True)
         (ws / "out" / "draft.tsv").write_text("0\tLời 0 giữ số 7\n1\tLời 1 giữ số 7\n2\tLời 2 giữ số 7\n")
@@ -101,7 +101,7 @@ def test_workspace_translate_follow_up_turn_for_missing_ids(monkeypatch, tmp_pat
     segments, anchors = _rail_and_units()
     calls = []
 
-    def fake(workspace, prompt, config, *, timeout=None, resume=False):
+    def fake(workspace, prompt, config, *, timeout=None, resume=False, cancel=None):
         from backend.app.agents.workspace import WorkspaceRun
 
         ws = Path(workspace)
@@ -137,7 +137,7 @@ def test_translate_bisects_a_short_session_instead_of_retrying(monkeypatch, tmp_
     units = [Anchor(id=i, start=i * 5.0, end=i * 5.0 + 4.0, source_ids=f"{i}-{i}", source_zh=f"字{i}") for i in range(60)]
     runs = {"n": 0}
 
-    def fake(workspace, prompt, config, *, timeout=None, resume=False):
+    def fake(workspace, prompt, config, *, timeout=None, resume=False, cancel=None):
         ws = Path(workspace)
         ws.mkdir(parents=True, exist_ok=True)
         runs["n"] += 1

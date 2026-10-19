@@ -2,14 +2,17 @@ import json
 import queue
 import shutil
 import threading
+import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from backend.app.core.config import Settings
 from backend.app.domain.artifacts import ArtifactKind
-from backend.app.domain.jobs import JobInput, JobManifest, JobState, PipelineConfig, StageRecord, StageStatus
+from backend.app.domain.jobs import JobInput, JobManifest, JobState, PipelineConfig, StageName, StageRecord, StageStatus
 from backend.app.pipeline.production import ProductionPipeline
+from backend.app.settings import SettingsStore, strip_secrets
 from backend.app.studio.providers import extract_url
 
 
@@ -29,6 +32,9 @@ def drop_missing_artifacts(manifest: JobManifest, data_dir: Path) -> JobManifest
     return manifest
 
 
+_PROGRESS_SAVE_INTERVAL = 1.0  # seconds; yt-dlp fires hooks many times per second
+
+
 class JobBusyError(RuntimeError):
     """Raised when an operation (e.g. delete) needs the job to be stopped first."""
 
@@ -39,6 +45,9 @@ class JobService:
         self.pipeline = ProductionPipeline(settings)
         self._lock = threading.Lock()
         self._cancel_requested: set[str] = set()
+        # The cancel event of each job whose pipeline (or download prefetch) is running:
+        # a stop request sets it and the stage in flight stops mid-way.
+        self._cancel_events: dict[str, threading.Event] = {}
         # Bounded FIFO queue so picking many episodes at once doesn't spawn one
         # pipeline thread per job (ASR + ffmpeg + TTS × N oversubscribes the box and
         # crashes it). A small pool of workers drains the queue; the rest wait.
@@ -82,6 +91,7 @@ class JobService:
                 manifest.stages[-1].error = "interrupted (server restart)"
             manifest.state = JobState.queued
             manifest.error = None
+            manifest.progress = None
             manifest.touch()
             self.save(manifest)
             self.start_background(manifest.job_id)
@@ -111,10 +121,22 @@ class JobService:
                 min_gap=self.settings.min_gap,
                 snap_gap=self.settings.snap_gap,
                 tail_out=self.settings.tail_out,
+                settings_snapshot=strip_secrets(SettingsStore(self.settings).load()),
             ),
         )
         self.save(manifest)
         return manifest
+
+    def refresh_settings(self, job_id: str) -> None:
+        """Re-freeze a stopped job's provider settings from the current store, so a retry
+        the user asks for runs with the providers set NOW (e.g. translation moved from an
+        exhausted agy pool to Claude Code). A server-restart resume keeps the old snapshot."""
+        manifest = self.get(job_id)
+        if manifest.state not in {JobState.failed, JobState.canceled}:
+            return
+        manifest.config.settings_snapshot = strip_secrets(SettingsStore(self.settings).load())
+        manifest.touch()
+        self.save(manifest)
 
     def start_background(self, job_id: str) -> None:
         """Enqueue a job to run on the worker pool (FIFO, bounded concurrency).
@@ -145,8 +167,10 @@ class JobService:
                     if job_id in self._cancel_requested:
                         return
                 context = self.pipeline.create_context(job_id, manifest.input, manifest.config)
+                context.cancel = self._watch_cancel(job_id)
                 stage = self.pipeline.stages[0]
                 record = StageRecord(name=stage.name, status=StageStatus.running, started_at=datetime.now(timezone.utc))
+                context.on_progress = self._progress_publisher(manifest, record)
                 result = stage.run(context)
                 record.status = StageStatus.succeeded
                 record.ended_at = datetime.now(timezone.utc)
@@ -159,11 +183,21 @@ class JobService:
                 manifest.stages.append(record)
                 manifest.artifacts.extend(result.artifacts)
                 manifest.metrics[result.name] = result.metrics
+                manifest.progress = None
                 manifest.touch()
                 self.save(manifest)
             except Exception:
-                pass  # the worker will download normally
+                # The worker will download normally; until then don't show a frozen bar.
+                try:
+                    manifest = self.get(job_id)
+                    if manifest.progress is not None:
+                        manifest.progress = None
+                        self.save(manifest)
+                except Exception:
+                    pass
             finally:
+                with self._lock:
+                    self._cancel_events.pop(job_id, None)
                 lock.release()
 
     def _ensure_workers(self) -> None:
@@ -190,11 +224,25 @@ class JobService:
 
     def run(self, job_id: str) -> None:
         with self._job_lock(job_id):
-            self._run_locked(job_id)
+            cancel = self._watch_cancel(job_id)
+            try:
+                self._run_locked(job_id, cancel)
+            finally:
+                with self._lock:
+                    self._cancel_events.pop(job_id, None)
+                    if cancel.is_set():
+                        self._cancel_requested.discard(job_id)
 
-    def _run_locked(self, job_id: str) -> None:
+    def _watch_cancel(self, job_id: str) -> threading.Event:
+        cancel = threading.Event()
+        with self._lock:
+            self._cancel_events[job_id] = cancel
+        return cancel
+
+    def _run_locked(self, job_id: str, cancel: threading.Event) -> None:
         manifest = self.get(job_id)
         context = self.pipeline.create_context(job_id, manifest.input, manifest.config)
+        context.cancel = cancel
         if self._take_cancel(job_id):
             return self._mark_canceled(manifest)
 
@@ -213,6 +261,7 @@ class JobService:
         manifest.artifacts = [artifact for record in kept for artifact in record.artifacts]
         manifest.metrics = {str(record.name): record.metrics for record in kept}
         manifest.error = None
+        manifest.progress = None
         manifest.state = JobState.running
         manifest.touch()
         self.save(manifest)
@@ -224,12 +273,20 @@ class JobService:
                 # already in flight (ffmpeg/LLM) finishes first, then we bail.
                 if self._take_cancel(job_id):
                     return self._mark_canceled(manifest)
+                # The render burns the overlay into the deliverable: never pick the
+                # cover boxes / caption / quality for the user — wait for their review.
+                if stage.name == StageName.package and not manifest.render_approved:
+                    return self._mark_review(manifest)
                 record = StageRecord(name=stage.name, status=StageStatus.running, started_at=datetime.now(timezone.utc))
                 manifest.stages.append(record)
+                context.reset_live()
+                context.on_progress = self._progress_publisher(manifest, record)
+                manifest.progress = self._live_progress(record, {})
                 manifest.touch()
                 self.save(manifest)
 
                 result = stage.run(context)
+                manifest.progress = None
                 record.status = StageStatus.succeeded
                 record.ended_at = datetime.now(timezone.utc)
                 record.artifacts = result.artifacts
@@ -244,14 +301,43 @@ class JobService:
             manifest.touch()
             self.save(manifest)
         except Exception as exc:
+            if cancel.is_set():
+                # the stage stopped because the user asked; what it wrote stays for a resume
+                return self._mark_canceled(manifest)
             if manifest.stages:
                 manifest.stages[-1].status = StageStatus.failed
                 manifest.stages[-1].ended_at = datetime.now(timezone.utc)
                 manifest.stages[-1].error = str(exc)
+            manifest.progress = None
             manifest.state = JobState.failed
             manifest.error = str(exc)
             manifest.touch()
             self.save(manifest)
+
+    def _progress_publisher(self, manifest: JobManifest, record: StageRecord) -> Callable[[dict, bool], None]:
+        """A stage's progress callback: put the latest live state on ``manifest`` and save
+        it — at once when ``urgent`` (a new step, a log line), else at most once per
+        interval (download hooks and counters fire many times per second). Stages call it
+        under the context's live lock, and the stage's thread owns the job lock, so writing
+        this in-memory manifest cannot race another writer."""
+        last_save = 0.0
+
+        def publish(live: dict, urgent: bool = False) -> None:
+            nonlocal last_save
+            manifest.progress = self._live_progress(record, live)
+            now = time.monotonic()
+            if not urgent and now - last_save < _PROGRESS_SAVE_INTERVAL:
+                return
+            last_save = now
+            manifest.touch()
+            self.save(manifest)
+
+        return publish
+
+    @staticmethod
+    def _live_progress(record: StageRecord, live: dict) -> dict:
+        started = record.started_at.isoformat() if record.started_at else None
+        return {"stage": str(record.name), "started_at": started, **live}
 
     def request_cancel(self, job_id: str) -> JobManifest:
         """Ask a pending/running job to stop. No-op for already-finished jobs.
@@ -259,10 +345,13 @@ class JobService:
         The running thread owns the state transition (to ``canceled``); here we only
         record the request so a forced delete never races the pipeline thread."""
         manifest = self.get(job_id)
-        if manifest.state in {JobState.succeeded, JobState.failed, JobState.canceled}:
+        if manifest.state in {JobState.succeeded, JobState.failed, JobState.canceled, JobState.review}:
             return manifest
         with self._lock:
             self._cancel_requested.add(job_id)
+            event = self._cancel_events.get(job_id)
+        if event is not None:
+            event.set()  # the stage in flight stops now, not at the next stage boundary
         return manifest
 
     def _take_cancel(self, job_id: str) -> bool:
@@ -278,8 +367,33 @@ class JobService:
             manifest.stages[-1].ended_at = datetime.now(timezone.utc)
             manifest.stages[-1].error = "canceled"
         manifest.state = JobState.canceled
+        manifest.progress = None
         manifest.touch()
         self.save(manifest)
+
+    def _mark_review(self, manifest: JobManifest) -> None:
+        manifest.state = JobState.review
+        manifest.progress = None
+        manifest.touch()
+        self.save(manifest)
+
+    def approve_render(self, job_id: str) -> JobManifest:
+        """The user reviewed the overlay: run (or re-run) the package stage with it."""
+        lock = self._job_lock(job_id)
+        if not lock.acquire(blocking=False):
+            raise JobBusyError(job_id)  # a worker or the prefetcher owns the job
+        try:
+            manifest = self.get(job_id)
+            if manifest.state == JobState.running:
+                raise JobBusyError(job_id)
+            if not manifest.render_approved:
+                manifest.render_approved = True
+                manifest.touch()
+                self.save(manifest)
+        finally:
+            lock.release()
+        self.start_background(job_id)
+        return self.get(job_id)
 
     def delete(self, job_id: str) -> None:
         """Remove a job and all its artifacts. Refuses while it is still running."""

@@ -22,6 +22,7 @@ class DubState(StrEnum):
 
     none = "none"            # not translated yet
     translating = "translating"
+    review = "review"        # dubbed, waiting for the user to review and start the render
     dubbed = "dubbed"
     failed = "failed"
 
@@ -66,6 +67,8 @@ class Episode(BaseModel):
     dub_stage_index: int | None = None
     dub_stage_total: int | None = None
     dub_error: str | None = None
+    # Live state of the stage in flight (step, counts, download bytes, last log lines).
+    dub_progress: dict | None = None
 
 
 class Series(BaseModel):
